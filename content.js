@@ -21,11 +21,15 @@
     const errorLink = [...document.querySelectorAll("a,button,[role='button']")]
       .some(element => isVisible(element) && normalized(element.innerText || element.textContent || "") === "ir para gestao de envios full");
     if (text.includes("ocorreu um erro") && errorLink) return "error";
-    const managementRoute = /\/shipping\/inbounds\/?$/.test(location.pathname);
-    const hasFinishAction = [...document.querySelectorAll("a[href],button,[role='button']")]
-      .some(element => isVisible(element) && normalized(element.innerText || element.textContent || "") === "terminar envio");
-    if ((text.includes("data reservada") && text.includes("custo aplicado") && text.includes("status")) || (managementRoute && hasFinishAction)) return "management";
     if (text.includes("preparacao do envio")) return "preparation";
+    const inboundRoute = /^\/shipping\/inbounds(?:\/|$)/.test(location.pathname);
+    const shipmentDetailRoute = /^\/shipping\/inbounds\/\d+(?:\/|$)/.test(location.pathname);
+    const managementRoute = inboundRoute && !shipmentDetailRoute;
+    const hasFinishAction = [...document.querySelectorAll("a[href],button,[role='button']")]
+      .some(element => isVisible(element) && /^(?:terminar|continuar|retomar|concluir) envio$/.test(normalized(element.innerText || element.textContent || element.getAttribute("aria-label"))));
+    const managementTable = text.includes("data reservada") &&
+      (text.includes("custo aplicado") || text.includes("declaradas") || text.includes("aptas para o full"));
+    if (managementTable || managementRoute || (inboundRoute && hasFinishAction)) return "management";
     const shipmentRoute = location.pathname.match(/^\/shipping\/inbounds\/(\d+)(?:\/([^/]+))?\/?$/);
     if (shipmentRoute && !/appointment/i.test(location.pathname) && text.includes("envio")) return "preparation";
     return "";
@@ -423,25 +427,52 @@
   }
 
   function hasShipmentId(text, shipmentId) {
-    return new RegExp(`(?:^|\\D)${shipmentId}(?!\\d)`).test(normalized(text));
+    if (!shipmentId) return false;
+    const flexibleId = [...shipmentId].join("\\D*");
+    return new RegExp("(?:^|\\D)" + flexibleId + "(?!\\d)").test(normalized(text));
+  }
+
+  function isNativeActionDisabled(element) {
+    return Boolean(element.disabled || element.hasAttribute("disabled") ||
+      element.getAttribute("aria-disabled") === "true" ||
+      /disabled|is-disabled/i.test(String(element.className || "") + " " + (element.getAttribute("data-state") || "")));
   }
 
   function visibleExactActions(scope, label) {
-    return [...scope.querySelectorAll("a[href],button,[role='button']")]
-      .filter(element => isVisible(element) && !isDisabled(element) && normalized(element.innerText || element.textContent || element.getAttribute("aria-label")) === label);
+    const matchesLabel = element => {
+      if (!isVisible(element) || isNativeActionDisabled(element)) return false;
+      const labels = [element.innerText, element.textContent, element.getAttribute("aria-label"), element.getAttribute("title")]
+        .filter(Boolean).map(normalized);
+      return labels.some(value => value === label || value.startsWith(label + " "));
+    };
+    const semanticActions = [...scope.querySelectorAll("a,button,[role='button'],[tabindex]")]
+      .filter(matchesLabel);
+    if (semanticActions.length) return semanticActions;
+    return [...scope.querySelectorAll("[data-testid]")].filter(matchesLabel);
   }
 
   function findFinishShipmentAction(shipmentId) {
     const matches = new Set();
-    const actions = visibleExactActions(document, "terminar envio");
+    const finishLabels = ["terminar envio", "continuar envio", "retomar envio", "concluir envio"];
+    const actions = [...new Set(finishLabels.flatMap(label => visibleExactActions(document, label)))];
+    const rows = [...document.querySelectorAll("tr,[role='row'],[data-testid*='row'],[class*='row']")]
+      .filter(row => isVisible(row) && hasShipmentId(row.innerText || row.textContent || "", shipmentId));
+    for (const row of rows) {
+      const rowActions = finishLabels.flatMap(label => visibleExactActions(row, label));
+      if (rowActions.length === 1) matches.add(rowActions[0]);
+    }
+    if (matches.size) return [...matches];
+
     for (const action of actions) {
       let ancestor = action.parentElement;
-      for (let depth = 0; ancestor && depth < 10; depth += 1, ancestor = ancestor.parentElement) {
+      for (let depth = 0; ancestor && depth < 12; depth += 1, ancestor = ancestor.parentElement) {
         const rowText = ancestor.innerText || ancestor.textContent || "";
         if (!hasShipmentId(rowText, shipmentId)) continue;
-        const rowActions = visibleExactActions(ancestor, "terminar envio");
-        if (rowActions.length === 1) matches.add(action);
-        break;
+        const rowActions = finishLabels.flatMap(label => visibleExactActions(ancestor, label));
+        if (rowActions.length === 1) {
+          matches.add(rowActions[0]);
+          break;
+        }
       }
     }
     return [...matches];
@@ -494,13 +525,9 @@
         if (actions.length === 1) return { action: actions[0] };
         if (actions.length > 1) return { error: "Encontrei mais de um link para Gestão de envios Full." };
       } else if (step === "management") {
-        const idVisible = hasShipmentId(document.body?.innerText || "", shipmentId);
         const actions = findFinishShipmentAction(shipmentId);
         if (actions.length === 1) return { action: actions[0] };
-        if (actions.length > 1) return { error: `Encontrei mais de uma ação “Terminar envio” na linha do envio #${shipmentId}.` };
-        if (idVisible && visibleExactActions(document, "terminar envio").length > 0) {
-          // A linha pode estar terminando de renderizar; aguardamos a próxima mutação.
-        }
+        if (actions.length > 1) return { error: `Encontrei mais de uma ação para continuar o envio #${shipmentId}.` };
       } else if (step === "preparation") {
         const idMatches = hasShipmentId(document.body?.innerText || "", shipmentId);
         const actions = idMatches ? findCollectionEditAction() : [];
@@ -517,7 +544,7 @@
       return { error: `A página de preparação não corresponde ao envio #${shipmentId}. Não cliquei em Editar.` };
     }
     if (step === "management") {
-      return { error: `Encontrei o envio #${shipmentId}, mas não uma única ação “Terminar envio” na linha dele. Confira o status do envio na Gestão.` };
+      return { error: `Encontrei o envio #${shipmentId}, mas não uma única ação para continuar na linha dele. Confira o status na Gestão.` };
     }
     if (step === "preparation") return { error: `Não encontrei um único “Editar” na seção da coleta do envio #${shipmentId}.` };
     return { error: "Encontrei a tela de erro, mas não um único link para Gestão de envios Full." };
